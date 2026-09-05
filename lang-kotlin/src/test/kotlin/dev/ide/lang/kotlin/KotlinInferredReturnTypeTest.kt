@@ -55,17 +55,32 @@ class KotlinInferredReturnTypeTest {
 
         fun typeOfF1() = service.topLevelByName("f1").firstOrNull()?.type?.toString()
 
-        // 400 nested inferences need far more than 256 KB, so this attempt exhausts the stack.
-        var overflowed = false
-        val shallow = Thread(null, {
-            try { typeOfF1() } catch (e: StackOverflowError) { overflowed = true }
-        }, "shallow-stack-inference", 256L * 1024)
-        shallow.start()
-        shallow.join(120_000)
-        assertTrue(!shallow.isAlive, "the shallow-stack inference did not finish")
-        assertTrue(overflowed, "the shallow attempt must surface the overflow, not swallow it")
+        // BOTH attempts run on a thread with an EXPLICIT stack size, because what this test asserts is the
+        // difference between the two: too little stack must surface the overflow, enough stack must still type
+        // the declaration afterwards. Taking the second measurement on whatever stack the test runner happens
+        // to give us made the result depend on the JVM and the runner: 400 nested inferences overflow the
+        // DEFAULT thread stack on some (GitHub's Ubuntu/JDK 25 runner, where this failed while passing on the
+        // JetBrains Runtime), and then the retry threw instead of returning "Int" and the assertion below never
+        // got to run. Pinning both sizes keeps the test measuring the memo, not the runner.
+        fun typeOfF1On(stackBytes: Long, name: String): Result<String?> {
+            var out: Result<String?> = Result.failure(IllegalStateException("$name never ran"))
+            val t = Thread(null, { out = runCatching { typeOfF1() } }, name, stackBytes)
+            t.start()
+            t.join(120_000)
+            assertTrue(!t.isAlive, "$name did not finish")
+            return out
+        }
 
-        assertEquals("Int", typeOfF1(), "the same declaration types normally once there is stack for it")
+        // 400 nested inferences need far more than 256 KB, so this attempt exhausts the stack.
+        val shallow = typeOfF1On(256L * 1024, "shallow-stack-inference")
+        assertTrue(
+            shallow.exceptionOrNull() is StackOverflowError,
+            "the shallow attempt must surface the overflow, not swallow it; got ${shallow.exceptionOrNull()}",
+        )
+
+        // The overflow must have left the memo untouched, so a retry with room types the declaration.
+        val deep = typeOfF1On(32L * 1024 * 1024, "deep-stack-inference")
+        assertEquals("Int", deep.getOrThrow(), "the same declaration types normally once there is stack for it")
     }
 
     companion object {
